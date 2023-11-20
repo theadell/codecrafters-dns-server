@@ -203,6 +203,8 @@ func main() {
 		var recvHeader Header
 		recvHeader.unmarshalBinary(buf[:size])
 		responseHeader.ID = recvHeader.ID
+		responseHeader.OPCODE = recvHeader.OPCODE
+		responseHeader.RD = recvHeader.RD
 		responseHeader.QR = true
 		responseHeader.QDCount = 1
 		responseHeader.ANCount = 1
