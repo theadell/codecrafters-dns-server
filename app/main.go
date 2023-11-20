@@ -50,7 +50,7 @@ func (h *Header) marshalBinary() []byte {
 		bits |= 1 << 15
 	}
 	opcode := h.OPCODE & 0x0F // Mask with 0x0F to keep only the lower 4 bits
-	// we shift it by 11 bits so that the MSB of opcode is at the 14th bit of `bits`
+	// shift by 11 bits so that the MSB of opcode is at the 14th bit of `bits`
 	bits |= uint16(opcode) << 11
 	if h.AA {
 		bits |= 1 << 10
