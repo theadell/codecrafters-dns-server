@@ -172,9 +172,60 @@ func (a *Answer) marshalBinary() []byte {
 
 type DNSMessage struct {
 	Header           Header
-	QuestionSection  []byte
-	AnswerSection    []byte
+	QuestionSection  Question
+	AnswerSection    Answer
 	AuthoritySecrion []byte
+}
+
+func parseDNSPacket(packet []byte) (*DNSMessage, error) {
+
+	var header Header
+	var question Question
+	header.unmarshalBinary(packet[:12])
+
+	payload := bytes.NewBuffer(packet[12:])
+
+	var labels []string
+	var length int
+
+	for {
+		if lengthByte, err := payload.ReadByte(); err != nil {
+			return nil, err
+		} else if lengthByte == 0 {
+			break
+		} else {
+			length = int(lengthByte)
+			label := make([]byte, length)
+			if _, err := payload.Read(label); err != nil {
+				return nil, err
+			}
+			labels = append(labels, string(label))
+		}
+	}
+
+	question.Name = strings.Join(labels, ".")
+	b := make([]byte, 4)
+	_, err := payload.Read(b)
+	if err != nil {
+		return nil, err
+	}
+	question.Type = binary.BigEndian.Uint16(b[:2])
+	question.Class = binary.BigEndian.Uint16(b[2:4])
+
+	return &DNSMessage{
+		Header:           header,
+		QuestionSection:  question,
+		AnswerSection:    Answer{},
+		AuthoritySecrion: []byte{},
+	}, nil
+}
+
+func (m *DNSMessage) marshalBinary() []byte {
+	buf := new(bytes.Buffer)
+	buf.Write(m.Header.marshalBinary())
+	buf.Write(m.QuestionSection.marshalBinary())
+	buf.Write(m.AnswerSection.marshalBinary())
+	return buf.Bytes()
 }
 
 func main() {
@@ -200,41 +251,34 @@ func main() {
 			break
 		}
 
-		var responseHeader Header
-		var recvHeader Header
-		recvHeader.unmarshalBinary(buf[:size])
-		responseHeader.ID = recvHeader.ID
-		responseHeader.OPCODE = recvHeader.OPCODE
-		if responseHeader.OPCODE == 0 {
-			responseHeader.RCode = 0
+		recvMsg, err := parseDNSPacket(buf[:size])
+		if err != nil {
+			fmt.Println("Failed to parse packet", err)
+		}
+		var response DNSMessage
+		response.Header.ID = recvMsg.Header.ID
+		response.Header.OPCODE = recvMsg.Header.OPCODE
+		if response.Header.OPCODE == 0 {
+			response.Header.RCode = 0
 		} else {
-			responseHeader.RCode = 4
+			response.Header.RCode = 4
 		}
-		responseHeader.RD = recvHeader.RD
-		responseHeader.QR = true
-		responseHeader.QDCount = 1
-		responseHeader.ANCount = 1
-
-		response := bytes.Buffer{}
-		header := responseHeader.marshalBinary()
-		q := Question{
-			Type:  1,
-			Class: 1,
-			Name:  "codecrafters.io",
-		}
+		response.Header.RD = recvMsg.Header.RD
+		response.Header.QR = true
+		response.Header.QDCount = 1
+		response.Header.ANCount = 1
+		response.QuestionSection = recvMsg.QuestionSection
 		answerIp := net.ParseIP("8.8.8.8")
 		answerIpData := answerIp.To4()
 		a := Answer{
-			Name:   "codecrafters.io",
-			Type:   1,
-			Class:  1,
+			Name:   recvMsg.QuestionSection.Name,
+			Type:   recvMsg.QuestionSection.Type,
+			Class:  recvMsg.QuestionSection.Class,
 			Length: uint16(len(answerIpData)),
 			Data:   answerIpData,
 		}
-		response.Write(header)
-		response.Write(q.marshalBinary())
-		response.Write(a.marshalBinary())
-		_, err = udpConn.WriteToUDP(response.Bytes(), source)
+		response.AnswerSection = a
+		_, err = udpConn.WriteToUDP(response.marshalBinary(), source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
