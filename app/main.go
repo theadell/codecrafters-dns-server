@@ -52,6 +52,7 @@ func (h *Header) marshalBinary() []byte {
 	opcode := h.OPCODE & 0x0F // Mask with 0x0F to keep only the lower 4 bits
 	// shift by 11 bits so that the MSB of opcode is at the 14th bit of `bits`
 	bits |= uint16(opcode) << 11
+
 	if h.AA {
 		bits |= 1 << 10
 	}
@@ -84,7 +85,7 @@ func (h *Header) unmarshalBinary(data []byte) {
 	h.ID = binary.BigEndian.Uint16(data[:2])
 	bits := binary.BigEndian.Uint16(data[2:4])
 	h.QR = (bits>>15)&1 == 1
-	h.OPCODE = uint8((bits >> 10) & 0x0F)
+	h.OPCODE = uint8((bits >> 11) & 0x0F)
 	h.AA = (bits>>10)&1 == 1
 	h.TC = (bits>>9)&1 == 1
 	h.RD = (bits>>8)&1 == 1
@@ -204,6 +205,11 @@ func main() {
 		recvHeader.unmarshalBinary(buf[:size])
 		responseHeader.ID = recvHeader.ID
 		responseHeader.OPCODE = recvHeader.OPCODE
+		if responseHeader.OPCODE == 0 {
+			responseHeader.RCode = 0
+		} else {
+			responseHeader.RCode = 4
+		}
 		responseHeader.RD = recvHeader.RD
 		responseHeader.QR = true
 		responseHeader.QDCount = 1
