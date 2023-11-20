@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 )
 
 type Header struct {
@@ -96,6 +97,30 @@ func (h *Header) unmarshalBinary(data []byte) {
 	h.ARCount = binary.BigEndian.Uint16(data[10:12])
 }
 
+type Question struct {
+	Name  string
+	Type  uint16
+	Class uint16
+}
+
+func (q *Question) marshalBinary() []byte {
+	buf := bytes.Buffer{}
+	labels := strings.Split(q.Name, ".")
+	for _, label := range labels {
+		if len(label) > 0 {
+			buf.WriteByte(byte(len(label)))
+			buf.WriteString(label)
+		}
+	}
+	buf.WriteByte(0)
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, q.Type)
+	buf.Write(b)
+	binary.BigEndian.PutUint16(b, q.Class)
+	buf.Write(b)
+	return buf.Bytes()
+}
+
 type DNSMessage struct {
 	Header           Header
 	QuestionSection  []byte
@@ -131,10 +156,18 @@ func main() {
 		recvHeader.unmarshalBinary(buf[:size])
 		responseHeader.ID = recvHeader.ID
 		responseHeader.QR = true
+		responseHeader.QDCount = 1
 
-		response := responseHeader.marshalBinary()
-
-		_, err = udpConn.WriteToUDP(response, source)
+		response := bytes.Buffer{}
+		header := responseHeader.marshalBinary()
+		q := Question{
+			Type:  1,
+			Class: 1,
+			Name:  "codecrafters.io",
+		}
+		response.Write(header)
+		response.Write(q.marshalBinary())
+		_, err = udpConn.WriteToUDP(response.Bytes(), source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
