@@ -85,10 +85,10 @@ func (h *Header) unmarshalBinary(data []byte) {
 	bits := binary.BigEndian.Uint16(data[2:4])
 	h.QR = (bits>>15)&1 == 1
 	h.OPCODE = uint8((bits >> 10) & 0x0F)
-	h.AA = (bits>>10)&0 == 1
-	h.TC = (bits>>9)&0 == 1
-	h.RD = (bits>>8)&0 == 1
-	h.RA = (bits>>7)&0 == 1
+	h.AA = (bits>>10)&1 == 1
+	h.TC = (bits>>9)&1 == 1
+	h.RD = (bits>>8)&1 == 1
+	h.RA = (bits>>7)&1 == 1
 	h.Z = 0
 	h.RCode = uint8(bits & 0x0F)
 	h.QDCount = binary.BigEndian.Uint16(data[4:6])
