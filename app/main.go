@@ -104,8 +104,17 @@ type Question struct {
 }
 
 func (q *Question) marshalBinary() []byte {
-	buf := bytes.Buffer{}
-	labels := strings.Split(q.Name, ".")
+	buf := new(bytes.Buffer)
+	encodeLabels(q.Name, buf)
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, q.Type)
+	buf.Write(b)
+	binary.BigEndian.PutUint16(b, q.Class)
+	buf.Write(b)
+	return buf.Bytes()
+}
+func encodeLabels(name string, buf *bytes.Buffer) {
+	labels := strings.Split(name, ".")
 	for _, label := range labels {
 		if len(label) > 0 {
 			buf.WriteByte(byte(len(label)))
@@ -113,11 +122,50 @@ func (q *Question) marshalBinary() []byte {
 		}
 	}
 	buf.WriteByte(0)
+}
+
+// Answer represents a DNS Resource Record (RR) as defined in the DNS protocol.
+// Each Answer contains the data about the domain name and the resource record associated with it.
+type Answer struct {
+	// Name represents the domain name encoded as a sequence of labels.
+	// Each label is a length-prefixed string, and the sequence is terminated by a zero-length label.
+	Name string
+
+	// Type is a 2-byte integer indicating the type of the record.
+	// Common values are 1 for an A record, 5 for a CNAME record, etc.
+	// The full list of types is specified in the DNS protocol specification.
+	Type uint16
+
+	// Class is a 2-byte integer typically set to 1 for Internet (IN) class.
+	// Other values are less common and are detailed in the DNS protocol specification.
+	Class uint16
+
+	// TTL (Time-To-Live) is a 4-byte integer that specifies the duration in seconds
+	// that the record may be cached before it should be discarded or refreshed.
+	TTL uint32
+
+	// RDLength is a 2-byte integer that specifies the length of the RDATA field in bytes.
+	Length uint16
+
+	// Data (RDATA) is a variable-length field containing the data of the record.
+	// The format of this data varies depending on the Type and Class of the record.
+	Data []byte
+}
+
+func (a *Answer) marshalBinary() []byte {
+	buf := new(bytes.Buffer)
+	encodeLabels(a.Name, buf)
 	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, q.Type)
+	binary.BigEndian.PutUint16(b, a.Type)
 	buf.Write(b)
-	binary.BigEndian.PutUint16(b, q.Class)
+	binary.BigEndian.PutUint16(b, a.Class)
 	buf.Write(b)
+	b32 := make([]byte, 4)
+	binary.BigEndian.PutUint32(b32, a.TTL)
+	buf.Write(b32)
+	binary.BigEndian.PutUint16(b, a.Length)
+	buf.Write(b)
+	buf.Write(a.Data)
 	return buf.Bytes()
 }
 
@@ -157,6 +205,7 @@ func main() {
 		responseHeader.ID = recvHeader.ID
 		responseHeader.QR = true
 		responseHeader.QDCount = 1
+		responseHeader.ANCount = 1
 
 		response := bytes.Buffer{}
 		header := responseHeader.marshalBinary()
@@ -165,8 +214,18 @@ func main() {
 			Class: 1,
 			Name:  "codecrafters.io",
 		}
+		answerIp := net.ParseIP("8.8.8.8")
+		answerIpData := answerIp.To4()
+		a := Answer{
+			Name:   "codecrafters.io",
+			Type:   1,
+			Class:  1,
+			Length: uint16(len(answerIpData)),
+			Data:   answerIpData,
+		}
 		response.Write(header)
 		response.Write(q.marshalBinary())
+		response.Write(a.marshalBinary())
 		_, err = udpConn.WriteToUDP(response.Bytes(), source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
