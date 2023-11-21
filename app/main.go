@@ -125,6 +125,119 @@ func encodeLabels(name string, buf *bytes.Buffer) {
 	buf.WriteByte(0)
 }
 
+// parseDNSQuestion parses a DNS question section from a given payload buffer and the entire packet.
+//
+// Each DNS question section follows the format specified in RFC 1035, Section 4.1.2. The section
+// typically contains a domain name, represented either as a sequence of labels (each preceded by its length)
+// or a pointer to a prior occurrence of the same name in the packet, or a combination of both. This
+// function handles these scenarios to accurately reconstruct the domain name.
+//
+// In the case of a label, the first byte indicates the length of the label, followed by the label itself.
+// A zero-length byte signifies the end of the domain name. In the case of a pointer, the first two bits
+// of the first byte are set to '11', and the remaining 14 bits represent an offset from the start of the packet
+// to the location of the domain name. This function detects pointers and resolves them to reconstruct
+// the complete domain name.
+//
+// After processing the domain name, the function then reads the next two fields: the question type (QTYPE)
+// and question class (QCLASS), each occupying 2 bytes.
+//
+// DNS Question Format:
+//
+// ```
+// +---------------------+
+// | Label Length (1B)   |  <-- Length of the label (if first two bits are 11, it's a pointer)
+// +---------------------+
+// | Label (Variable)    |  <-- Label itself (if previous byte was a length)
+// +---------------------+
+// | 0x00                |  <-- End of domain name
+// +---------------------+
+// | Type (2B)           |  <-- Type of DNS query (e.g., A, MX, etc.)
+// +---------------------+
+// | Class (2B)          |  <-- Class of DNS query (e.g., IN for Internet)
+// +---------------------+
+// ```
+// in case of compression
+// ```
+// +---------------------+
+// | 11 (2 bits)         |  <-- Indicator that this is a pointer
+// +---------------------+
+// | Offset (14 bits)    |  <-- Offset to the location of the domain name in the packet
+// +---------------------+
+// ```
+func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
+	var question Question
+	var labels []string
+
+	for {
+		lengthByte, err := payload.ReadByte()
+		if err != nil {
+			return Question{}, err
+		}
+
+		// 0 byte means the end of a name
+		if lengthByte == 0 {
+			break
+		}
+
+		// if the 2 MSB of this byte are b11, this means it is a pointer
+		if lengthByte&0xC0 == 0xC0 {
+			secondByte, err := payload.ReadByte()
+			if err != nil {
+				return Question{}, err
+			}
+			// offset is the next 14 bits interpted as uinit 16
+			// first byte is masked with 0x3F to unset the 2 MSB
+			offset := int(lengthByte&0x3F)<<8 + int(secondByte)
+
+			// Extract name from the offset
+			offsetPayload := bytes.NewBuffer(packet[offset:])
+			for {
+				offLengthByte, err := offsetPayload.ReadByte()
+				if err != nil {
+					return Question{}, err
+				}
+
+				if offLengthByte == 0 {
+					break
+				}
+
+				// Read the label based on its length and append it to labels slice
+				offLabel := make([]byte, offLengthByte)
+				_, err = offsetPayload.Read(offLabel)
+				if err != nil {
+					return Question{}, err
+				}
+				labels = append(labels, string(offLabel))
+			}
+
+			// Break out of the main loop as the domain name is fully read
+			break
+		}
+
+		// Regular label
+		label := make([]byte, lengthByte)
+		_, err = payload.Read(label)
+		if err != nil {
+			return Question{}, err
+		}
+		labels = append(labels, string(label))
+	}
+
+	question.Name = strings.Join(labels, ".")
+
+	// Read Type and Class
+	err := binary.Read(payload, binary.BigEndian, &question.Type)
+	if err != nil {
+		return Question{}, err
+	}
+	err = binary.Read(payload, binary.BigEndian, &question.Class)
+	if err != nil {
+		return Question{}, err
+	}
+
+	return question, nil
+}
+
 // Answer represents a DNS Resource Record (RR) as defined in the DNS protocol.
 // Each Answer contains the data about the domain name and the resource record associated with it.
 type Answer struct {
@@ -172,50 +285,28 @@ func (a *Answer) marshalBinary() []byte {
 
 type DNSMessage struct {
 	Header           Header
-	QuestionSection  Question
-	AnswerSection    Answer
+	QuestionSection  []Question
+	AnswerSection    []Answer
 	AuthoritySecrion []byte
 }
 
 func parseDNSPacket(packet []byte) (*DNSMessage, error) {
 
 	var header Header
-	var question Question
 	header.unmarshalBinary(packet[:12])
-
+	questions := make([]Question, 0, header.QDCount)
 	payload := bytes.NewBuffer(packet[12:])
-
-	var labels []string
-	var length int
-
-	for {
-		if lengthByte, err := payload.ReadByte(); err != nil {
+	for i := 0; i < int(header.QDCount); i++ {
+		q, err := parseDNSQuestion(payload, packet)
+		if err != nil {
 			return nil, err
-		} else if lengthByte == 0 {
-			break
-		} else {
-			length = int(lengthByte)
-			label := make([]byte, length)
-			if _, err := payload.Read(label); err != nil {
-				return nil, err
-			}
-			labels = append(labels, string(label))
 		}
+		questions = append(questions, q)
 	}
-
-	question.Name = strings.Join(labels, ".")
-	b := make([]byte, 4)
-	_, err := payload.Read(b)
-	if err != nil {
-		return nil, err
-	}
-	question.Type = binary.BigEndian.Uint16(b[:2])
-	question.Class = binary.BigEndian.Uint16(b[2:4])
-
 	return &DNSMessage{
 		Header:           header,
-		QuestionSection:  question,
-		AnswerSection:    Answer{},
+		QuestionSection:  questions,
+		AnswerSection:    make([]Answer, 0),
 		AuthoritySecrion: []byte{},
 	}, nil
 }
@@ -223,8 +314,12 @@ func parseDNSPacket(packet []byte) (*DNSMessage, error) {
 func (m *DNSMessage) marshalBinary() []byte {
 	buf := new(bytes.Buffer)
 	buf.Write(m.Header.marshalBinary())
-	buf.Write(m.QuestionSection.marshalBinary())
-	buf.Write(m.AnswerSection.marshalBinary())
+	for _, q := range m.QuestionSection {
+		buf.Write(q.marshalBinary())
+	}
+	for _, a := range m.AnswerSection {
+		buf.Write(a.marshalBinary())
+	}
 	return buf.Bytes()
 }
 
@@ -250,8 +345,8 @@ func main() {
 			fmt.Println("Error receiving data:", err)
 			break
 		}
-
-		recvMsg, err := parseDNSPacket(buf[:size])
+		packet := buf[:size]
+		recvMsg, err := parseDNSPacket(packet)
 		if err != nil {
 			fmt.Println("Failed to parse packet", err)
 		}
@@ -265,19 +360,23 @@ func main() {
 		}
 		response.Header.RD = recvMsg.Header.RD
 		response.Header.QR = true
-		response.Header.QDCount = 1
-		response.Header.ANCount = 1
+		response.Header.QDCount = recvMsg.Header.QDCount
+		response.Header.ANCount = recvMsg.Header.QDCount
 		response.QuestionSection = recvMsg.QuestionSection
+		response.AnswerSection = make([]Answer, 0)
 		answerIp := net.ParseIP("8.8.8.8")
 		answerIpData := answerIp.To4()
-		a := Answer{
-			Name:   recvMsg.QuestionSection.Name,
-			Type:   recvMsg.QuestionSection.Type,
-			Class:  recvMsg.QuestionSection.Class,
-			Length: uint16(len(answerIpData)),
-			Data:   answerIpData,
+		for _, q := range recvMsg.QuestionSection {
+			a := Answer{
+				Name:   q.Name,
+				Type:   q.Type,
+				Class:  q.Class,
+				TTL:    1000,
+				Length: uint16(len(answerIpData)),
+				Data:   answerIpData,
+			}
+			response.AnswerSection = append(response.AnswerSection, a)
 		}
-		response.AnswerSection = a
 		_, err = udpConn.WriteToUDP(response.marshalBinary(), source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
