@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 )
 
@@ -166,12 +168,34 @@ func encodeLabels(name string, buf *bytes.Buffer) {
 // ```
 func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
 	var question Question
+
+	name, err := parseDNSName(payload, packet)
+	if err != nil {
+		return Question{}, err
+	}
+	question.Name = name
+	// Read Type and Class
+	err = binary.Read(payload, binary.BigEndian, &question.Type)
+	if err != nil {
+		return Question{}, err
+	}
+	err = binary.Read(payload, binary.BigEndian, &question.Class)
+	if err != nil {
+		return Question{}, err
+	}
+
+	return question, nil
+}
+
+// parseDNSName parses a domain name from the DNS payload.
+// It handles both regular labels and compressed pointers.
+func parseDNSName(payload *bytes.Buffer, packet []byte) (string, error) {
 	var labels []string
 
 	for {
 		lengthByte, err := payload.ReadByte()
 		if err != nil {
-			return Question{}, err
+			return "", err
 		}
 
 		// 0 byte means the end of a name
@@ -183,7 +207,7 @@ func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
 		if lengthByte&0xC0 == 0xC0 {
 			secondByte, err := payload.ReadByte()
 			if err != nil {
-				return Question{}, err
+				return "", err
 			}
 			// offset is the next 14 bits interpted as uinit 16
 			// first byte is masked with 0x3F to unset the 2 MSB
@@ -194,7 +218,7 @@ func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
 			for {
 				offLengthByte, err := offsetPayload.ReadByte()
 				if err != nil {
-					return Question{}, err
+					return "", err
 				}
 
 				if offLengthByte == 0 {
@@ -205,7 +229,7 @@ func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
 				offLabel := make([]byte, offLengthByte)
 				_, err = offsetPayload.Read(offLabel)
 				if err != nil {
-					return Question{}, err
+					return "", err
 				}
 				labels = append(labels, string(offLabel))
 			}
@@ -218,24 +242,13 @@ func parseDNSQuestion(payload *bytes.Buffer, packet []byte) (Question, error) {
 		label := make([]byte, lengthByte)
 		_, err = payload.Read(label)
 		if err != nil {
-			return Question{}, err
+			return "", err
 		}
 		labels = append(labels, string(label))
 	}
 
-	question.Name = strings.Join(labels, ".")
+	return strings.Join(labels, "."), nil
 
-	// Read Type and Class
-	err := binary.Read(payload, binary.BigEndian, &question.Type)
-	if err != nil {
-		return Question{}, err
-	}
-	err = binary.Read(payload, binary.BigEndian, &question.Class)
-	if err != nil {
-		return Question{}, err
-	}
-
-	return question, nil
 }
 
 // Answer represents a DNS Resource Record (RR) as defined in the DNS protocol.
@@ -282,6 +295,52 @@ func (a *Answer) marshalBinary() []byte {
 	buf.Write(a.Data)
 	return buf.Bytes()
 }
+func parseAnswerSection(buf *bytes.Buffer, packet []byte, answerCount int) ([]Answer, error) {
+	answerSection := make([]Answer, 0)
+	for i := 0; i < answerCount; i++ {
+		a := Answer{
+			Name:   "",
+			Type:   0,
+			Class:  0,
+			TTL:    0,
+			Length: 0,
+			Data:   []byte{},
+		}
+		name, err := parseDNSName(buf, packet)
+		if err != nil {
+			return nil, err
+		}
+		a.Name = name
+		err = binary.Read(buf, binary.BigEndian, &a.Type)
+		if err != nil {
+			fmt.Println("failed to read answer type")
+			return nil, err
+		}
+		err = binary.Read(buf, binary.BigEndian, &a.Class)
+		if err != nil {
+			fmt.Println("failed to read answer class")
+			return nil, err
+		}
+		err = binary.Read(buf, binary.BigEndian, &a.TTL)
+		if err != nil {
+			fmt.Println("failed to read answer TTL")
+			return nil, err
+		}
+		err = binary.Read(buf, binary.BigEndian, &a.Length)
+		if err != nil {
+			return nil, err
+		}
+		dataBuf := make([]byte, a.Length)
+		_, err = buf.Read(dataBuf)
+		if err != nil {
+			fmt.Println("failed to read data of answer")
+			return nil, err
+		}
+		a.Data = dataBuf
+		answerSection = append(answerSection, a)
+	}
+	return answerSection, nil
+}
 
 type DNSMessage struct {
 	Header           Header
@@ -291,7 +350,7 @@ type DNSMessage struct {
 }
 
 func parseDNSPacket(packet []byte) (*DNSMessage, error) {
-
+	msg := &DNSMessage{}
 	var header Header
 	header.unmarshalBinary(packet[:12])
 	questions := make([]Question, 0, header.QDCount)
@@ -303,12 +362,17 @@ func parseDNSPacket(packet []byte) (*DNSMessage, error) {
 		}
 		questions = append(questions, q)
 	}
-	return &DNSMessage{
-		Header:           header,
-		QuestionSection:  questions,
-		AnswerSection:    make([]Answer, 0),
-		AuthoritySecrion: []byte{},
-	}, nil
+	if header.ANCount > 0 {
+		answerSection, err := parseAnswerSection(payload, packet, int(header.ANCount))
+		if err != nil {
+			fmt.Println("failed to parse answer section", err)
+			return nil, err
+		}
+		msg.AnswerSection = answerSection
+	}
+	msg.Header = header
+	msg.QuestionSection = questions
+	return msg, nil
 }
 
 func (m *DNSMessage) marshalBinary() []byte {
@@ -324,6 +388,18 @@ func (m *DNSMessage) marshalBinary() []byte {
 }
 
 func main() {
+
+	resolver := flag.String("resolver", "", "DNS Server Addr to forward to")
+	flag.Parse()
+	if *resolver == "" {
+		println("resolver addr was not set")
+		os.Exit(1)
+	}
+	resolverAddr, err := net.ResolveUDPAddr("udp", strings.TrimSpace(*resolver))
+	if err != nil {
+		fmt.Println("Failed to resolve UDP address:", err)
+		return
+	}
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
 		fmt.Println("Failed to resolve UDP address:", err)
@@ -350,36 +426,67 @@ func main() {
 		if err != nil {
 			fmt.Println("Failed to parse packet", err)
 		}
-		var response DNSMessage
-		response.Header.ID = recvMsg.Header.ID
-		response.Header.OPCODE = recvMsg.Header.OPCODE
-		if response.Header.OPCODE == 0 {
-			response.Header.RCode = 0
-		} else {
-			response.Header.RCode = 4
+		go handleDnsQuery(udpConn, source, recvMsg, resolverAddr)
+	}
+}
+
+func handleDnsQuery(lconn *net.UDPConn, sourceAddr *net.UDPAddr, msg *DNSMessage, resolverAddr *net.UDPAddr) {
+	conn, err := net.DialUDP("udp", nil, resolverAddr)
+	if err != nil {
+		fmt.Println("failed to create a udp connection", err)
+		return
+	}
+	defer conn.Close()
+
+	answers := make([]Answer, 0)
+	for _, question := range msg.QuestionSection {
+		nm := DNSMessage{
+			Header:          msg.Header,
+			QuestionSection: []Question{question},
+			AnswerSection:   []Answer{},
 		}
-		response.Header.RD = recvMsg.Header.RD
-		response.Header.QR = true
-		response.Header.QDCount = recvMsg.Header.QDCount
-		response.Header.ANCount = recvMsg.Header.QDCount
-		response.QuestionSection = recvMsg.QuestionSection
-		response.AnswerSection = make([]Answer, 0)
-		answerIp := net.ParseIP("8.8.8.8")
-		answerIpData := answerIp.To4()
-		for _, q := range recvMsg.QuestionSection {
-			a := Answer{
-				Name:   q.Name,
-				Type:   q.Type,
-				Class:  q.Class,
-				TTL:    1000,
-				Length: uint16(len(answerIpData)),
-				Data:   answerIpData,
-			}
-			response.AnswerSection = append(response.AnswerSection, a)
-		}
-		_, err = udpConn.WriteToUDP(response.marshalBinary(), source)
+		nm.Header.QDCount = 1
+		nm.Header.ANCount = 0
+
+		nmBytes := nm.marshalBinary()
+		_, err = conn.Write(nmBytes)
 		if err != nil {
-			fmt.Println("Failed to send response:", err)
+			fmt.Println("failed to write to UDP connection", err)
+			continue
 		}
+
+		buffer := make([]byte, 512)
+		n, err := conn.Read(buffer)
+		if err != nil {
+			fmt.Println("failed to read from UDP connection", err)
+			continue
+		}
+
+		resp, err := parseDNSPacket(buffer[:n])
+		if err != nil {
+			fmt.Println("failed to unmarshal DNS response", err)
+			continue
+		}
+
+		answers = append(answers, resp.AnswerSection...)
+	}
+
+	finalResponse := DNSMessage{
+		Header:          msg.Header,
+		QuestionSection: msg.QuestionSection,
+		AnswerSection:   answers,
+	}
+	if finalResponse.Header.OPCODE != 0 {
+		finalResponse.Header.RCode = 4
+	} else {
+		finalResponse.Header.RCode = 0
+	}
+	finalResponse.Header.QR = true
+	finalResponse.Header.ANCount = uint16(len(answers))
+	finalResponseBytes := finalResponse.marshalBinary()
+
+	_, err = lconn.WriteToUDP(finalResponseBytes, sourceAddr)
+	if err != nil {
+		fmt.Println("failed to send response", err)
 	}
 }
